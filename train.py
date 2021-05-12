@@ -1,8 +1,7 @@
 # coding=utf-8
 from __future__ import absolute_import, division, print_function
 
-from comet_ml import Experiment
-experiment = Experiment(auto_metric_logging=False)
+from utils.comet_utils import CometLogger
 import logging
 import argparse
 import os
@@ -53,7 +52,7 @@ def reduce_mean(tensor, nprocs):
     rt /= nprocs
     return rt
 
-def save_model(args, model):
+def save_model(args, model, comet_logger):
     model_to_save = model.module if hasattr(model, 'module') else model
     model_checkpoint = os.path.join(args.output_dir, "%s_checkpoint.bin" % args.name)
     if args.fp16:
@@ -66,14 +65,14 @@ def save_model(args, model):
             'model': model_to_save.state_dict(),
         }
     torch.save(checkpoint, model_checkpoint)
-    experiment.log_model('TRANSFG', model_checkpoint)
+    comet_logger.log_model('TRANSFG', model_checkpoint)
     logger.info("Saved model checkpoint to [DIR: %s]", args.output_dir)
 
-def setup(args):
+def setup(args, comet_logger):
     # Prepare model
     config = CONFIGS[args.model_type]
-    experiment.log_others(vars(args))
-    experiment.log_others(vars(config)['_fields'])
+    comet_logger.log_others(vars(args))
+    comet_logger.log_others(vars(config)['_fields'])
     config.split = args.split
     config.slide_step = args.slide_step
 
@@ -88,7 +87,7 @@ def setup(args):
     elif args.dataset == "INat2017":
         num_classes = 5089
 
-    experiment.log_other('num_classes', num_classes)
+    comet_logger.log_other('num_classes', num_classes)
     model = VisionTransformer(config, args.img_size, zero_head=True, num_classes=num_classes,                                                   smoothing_value=args.smoothing_value)
 
     model.load_from(np.load(args.pretrained_dir))
@@ -171,7 +170,7 @@ def valid(args, model, writer, test_loader, global_step):
         
     return val_accuracy, eval_losses.avg
 
-def train(args, model):
+def train(args, model, comet_logger):
     """ Train the model """
     if args.local_rank in [-1, 0]:
         os.makedirs(args.output_dir, exist_ok=True)
@@ -230,10 +229,10 @@ def train(args, model):
             batch = tuple(t.to(args.device) for t in batch)
             x, y = batch
             if step % 100 == 0:
-                experiment.log_image(x[0].detach().cpu().numpy(),
-                                     name='train_images',
-                                     image_channels="first",
-                                     step=global_step)
+                comet_logger.log_image(x[0].detach().cpu().numpy(),
+                                       name='train_images',
+                                       image_channels="first",
+                                       step=global_step)
 
             loss, logits = model(x, y)
             loss = loss.mean()
@@ -274,26 +273,26 @@ def train(args, model):
                     "Training (%d / %d Steps) (loss=%2.5f)" % (global_step, t_total, losses.val)
                 )
 
-                experiment.log_metric("train_loss", loss.item()*
-                                      args.gradient_accumulation_steps,
-                                      step=global_step, epoch=epoch_number)
-                experiment.log_metric("train_lr", scheduler.get_lr()[0],
-                                      step=global_step, epoch=epoch_number)
+                comet_logger.log_metric("train_loss", loss.item()*
+                                        args.gradient_accumulation_steps,
+                                        step=global_step, epoch=epoch_number)
+                comet_logger.log_metric("train_lr", scheduler.get_lr()[0],
+                                        step=global_step, epoch=epoch_number)
                 if args.local_rank in [-1, 0]:
                     writer.add_scalar("train/loss", scalar_value=losses.val, global_step=global_step)
                     writer.add_scalar("train/lr", scalar_value=scheduler.get_lr()[0], global_step=global_step)
                 if global_step % args.eval_every == 0:
                     with torch.no_grad():
                         accuracy, eval_loss = valid(args, model, writer, test_loader, global_step)
-                        experiment.log_metric("valid_acc", accuracy,
-                                              step=global_step,
-                                              epoch=epoch_number)
-                        experiment.log_metric("valid_loss", eval_loss,
-                                              step=global_step,
-                                              epoch=epoch_number)
+                        comet_logger.log_metric("valid_acc", accuracy,
+                                                step=global_step,
+                                                epoch=epoch_number)
+                        comet_logger.log_metric("valid_loss", eval_loss,
+                                                step=global_step,
+                                                epoch=epoch_number)
                     if args.local_rank in [-1, 0]:
                         if best_acc < accuracy:
-                            save_model(args, model)
+                            save_model(args, model, comet_logger)
                             best_acc = accuracy
                         logger.info("best accuracy so far: %f" % best_acc)
                     model.train()
@@ -317,8 +316,8 @@ def train(args, model):
     logger.info("End Training!")
     end_time = time.time()
     logger.info("Total Training Time: \t%f" % ((end_time - start_time) / 3600))
-    experiment.log_metric('best_acc', best_acc)
-    experiment.log_other('total_training_time', (end_time - start_time) / 3600)
+    comet_logger.log_metric('best_acc', best_acc)
+    comet_logger.log_other('total_training_time', (end_time - start_time) / 3600)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -384,8 +383,11 @@ def main():
                         help="Split method")
     parser.add_argument('--slide_step', type=int, default=12,
                         help="Slide step for overlap split")
+    parser.add_argument('--comet', type=bool, default=False,
+                        help='enable comet logging')
 
     args = parser.parse_args()
+
 
     # if args.fp16 and args.smoothing_value != 0:
     #     raise NotImplementedError("label smoothing not supported for fp16 training now")
@@ -404,20 +406,21 @@ def main():
     args.nprocs = torch.cuda.device_count()
 
     # Setup logging
+    comet_logger = CometLogger(args.comet, auto_metric_logging=False)
     logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
                         datefmt='%m/%d/%Y %H:%M:%S',
                         level=logging.INFO if args.local_rank in [-1, 0] else logging.WARN)
     logger.warning("Process rank: %s, device: %s, n_gpu: %s, distributed training: %s, 16-bits training: %s" %
                    (args.local_rank, args.device, args.n_gpu, bool(args.local_rank != -1), args.fp16))
-    experiment.log_code("./models/modeling.py")
+    comet_logger.log_code("./models/modeling.py")
     
     # Set seed
     set_seed(args)
 
     # Model & Tokenizer Setup
-    args, model = setup(args)
+    args, model = setup(args, comet_logger)
     # Training
-    train(args, model)
+    train(args, model, comet_logger)
 
 if __name__ == "__main__":
     main()
